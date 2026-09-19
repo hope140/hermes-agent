@@ -38,6 +38,7 @@ class FailoverReason(enum.Enum):
     billing = "billing"                  # 402 or confirmed credit exhaustion — rotate immediately
     rate_limit = "rate_limit"            # 429 or quota-based throttling — backoff then rotate
     upstream_rate_limit = "upstream_rate_limit"  # Aggregator's upstream model 429 — fallback model, key is healthy
+    upstream_blocked = "upstream_blocked"  # 403 from a WAF/CDN/proxy in front of the provider — key is healthy, fallback
     overloaded = "overloaded"            # 503/529 — provider overloaded, backoff
     server_error = "server_error"        # 500/502 — internal server error, retry
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
@@ -416,6 +417,17 @@ _SSL_TRANSIENT_PATTERNS = (
 )
 
 
+# A 403 body written by a WAF/CDN/proxy rather than the provider's API: Cloudflare's browser
+# challenge and block pages, plus the plain-text block relays return when they reject the SDK
+# User-Agent (#53099). Matched only on 403 (see ``_status_403``); a bare "access denied" or
+# "forbidden" stays auth because providers word real permission errors that way too.
+_UPSTREAM_BLOCKED_PATTERNS = (
+    "your request was blocked", "request blocked", "sorry, you have been blocked",
+    "enable javascript and cookies to continue", "cdn-cgi/challenge-platform", "cf-browser-verification",
+    "challenge-error-text", "__cf_chl", "cf-error-details", "attention required! | cloudflare",
+)
+
+
 # ── Verdicts and rule tables ────────────────────────────────────────────
 # A verdict is the ClassifiedError kwargs a stage decided on: ``reason`` plus
 # hint overrides (unlisted hints keep dataclass defaults). Rule tables are
@@ -438,6 +450,7 @@ _V_RATE_LIMIT = _v(_R.rate_limit, **_ROTATE_FALLBACK)
 _V_AUTH_ROTATE = _v(_R.auth, retryable=False, **_ROTATE_FALLBACK)
 _V_AUTH_FALLBACK = _v(_R.auth, **_ABORT_FALLBACK)
 _V_MODEL_NOT_FOUND = _v(_R.model_not_found, **_ABORT_FALLBACK)
+_V_UPSTREAM_BLOCKED = _v(_R.upstream_blocked, **_ABORT_FALLBACK)
 _V_CONTENT_BLOCKED = _v(_R.content_policy_blocked, **_ABORT_FALLBACK)
 # Another account in the same pool may hold the entitlement; the credential itself is healthy.
 _V_MODEL_ENTITLEMENT = _v(_R.model_entitlement, retryable=False, **_ROTATE_FALLBACK)
@@ -755,9 +768,12 @@ def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     # retry loop strips them. Exclude the Qwen/vLLM "No user query found" error
     # local engines wrap as "Unable to generate parser for this template" —
     # that is a poisoned transcript (→ format_error), not a grammar problem.
+    # Strict OpenAI-compatible schema validators reject regex lookaround in ``pattern``
+    # with a different sentence ("Invalid JSON schema: regex lookaround is not supported",
+    # #42631); same recovery — strip ``pattern``/``format`` and retry once.
     grammar_hit = "error parsing grammar" in msg or "json-schema-to-grammar" in msg or (
         "unable to generate parser" in msg and "template" in msg
-    )
+    ) or ("invalid json schema" in msg and "regex lookaround" in msg and "not supported" in msg)
     if status == 400 and grammar_hit and _NO_USER_QUERY_SIGNAL not in msg:
         return _v(_R.llama_cpp_grammar_pattern)
     # xAI Grok entitlement as an SSE ``type=error`` frame: no status, matches no
@@ -912,7 +928,14 @@ def _status_403(c: _Ctx) -> Verdict:
     # OpenRouter 403 "key limit exceeded" and similar plan/credit exhaustion are billing.
     xai_spend = c.provider_slug == "xai-oauth" and c.code == _XAI_SPENDING_LIMIT_ERROR_CODE
     billing = xai_spend or any(p in c.msg for p in ("key limit exceeded", "spending limit") + _BILLING_PATTERNS)
-    return _V_BILLING if billing else _V_AUTH_FALLBACK
+    if billing:
+        return _V_BILLING
+    # A WAF/CDN in front of the provider answered, not the provider: the credential never
+    # reached it, so key guidance and credential rotation are wrong (#53099, #70566). Gated on
+    # 403 and on established block/challenge markers; any other 403 stays auth.
+    if any(p in c.msg for p in _UPSTREAM_BLOCKED_PATTERNS):
+        return _V_UPSTREAM_BLOCKED
+    return _V_AUTH_FALLBACK
 
 
 def _status_404(c: _Ctx) -> Verdict:
@@ -950,6 +973,10 @@ def _status_429(c: _Ctx) -> Verdict:
     explicit_rate_limit = any(p in c.msg for p in _RATE_LIMIT_PATTERNS)
     if quota_wall and not explicit_rate_limit and not _has_usage_limit_transient_signal(c.msg, c.body, c.headers):
         return _V_BILLING
+    # Carry the reset window so the terminal copy can name it instead of "wait a minute" (#89401).
+    reset = _rate_limit_reset_seconds(c.msg, c.body, c.headers)
+    if reset:
+        return _v(_R.rate_limit, **_ROTATE_FALLBACK, error_context={"reset_at": time.time() + reset})
     return _V_RATE_LIMIT
 
 
@@ -1117,6 +1144,24 @@ def _has_usage_limit_transient_signal(error_msg: str, body: dict, response_heade
     return False
 
 
+def _rate_limit_reset_seconds(error_msg: str, body: dict, response_headers) -> Optional[float]:
+    """Seconds until a 429's window reopens, from the body's reset fields, ``Retry-After`` or the
+    message grammar (``retry after Ns`` / ``resets in 4hr``); None when the response names none."""
+    from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_message
+    for payload in (p for p in (body, _error_obj(body)) if isinstance(p, dict)):
+        for name in _RESET_FIELDS:
+            value = payload.get(name)
+            if value in (None, ""):
+                continue
+            if name.endswith("_at") and isinstance(value, (int, float)):
+                return max(0.0, float(value) - time.time())
+            if (seconds := parse_retry_after_seconds(value)) is not None:
+                return seconds
+    if (seconds := parse_retry_after_seconds(response_headers)) is not None:
+        return seconds
+    return reset_delay_from_message(error_msg)
+
+
 def _model_id_missing_known_prefix(model: str, provider: str) -> bool:
     """True when a bare model id is only known to the provider as ``vendor/id``.
 
@@ -1212,12 +1257,18 @@ def _build_error_msg(error: Exception, body: Any) -> str:
 
 
 def _body_message_candidates(body: dict) -> Iterator[Any]:
-    """Body message fields in priority order (OpenAI, flat, litellm/Bedrock proxy shapes)."""
+    """Body message fields in priority order (OpenAI, flat, litellm/Bedrock proxy, FastAPI shapes)."""
     yield _error_obj(body).get("message")
     yield body.get("message")
     yield body.get("errorMessage")
     args = body.get("errorArgs")
     yield args.get("reason") if isinstance(args, dict) else None
+    # FastAPI/Starlette relays and the Codex gateway answer {"detail": "..."} (or a nested
+    # OpenAI-ish object); without it a descriptive rejection reads as a bare 400 and the
+    # large-session heuristic sends it into compression (#81558). A list here is pydantic's
+    # validation shape, read by _oversized_message_content_rejection.
+    detail = body.get("detail")
+    yield detail.get("message") if isinstance(detail, dict) else detail if isinstance(detail, str) else None
 
 
 def _from_cause_chain(error: Exception, pick: Callable[[Any], Any], default: Any) -> Any:
